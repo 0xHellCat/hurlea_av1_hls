@@ -65,7 +65,7 @@ def extract_all_subs(input_file, out_sub_dir, streams):
         out_vtt = out_sub_dir / f"{base}.vtt"
 
         cmd = [
-            "ffmpeg", "-y", "-i", input_file,
+            "ffmpeg", "-y", "-i", str(input_file),
             "-map", f"0:s:{i}",
             "-c:s", "webvtt",
             str(out_vtt)
@@ -94,11 +94,11 @@ def generate_audio_playlists(input_file, audio_root, streams):
         audio_dir = audio_root / base
         audio_dir.mkdir(parents=True, exist_ok=True)
 
-        playlist_path = audio_dir / f"{base}.m3u8"
-        segment_pattern = audio_dir / f"{base}_%03d.m4s"
+        playlist_path = str(audio_dir / f"{base}.m3u8")
+        segment_pattern = str(audio_dir / f"{base}_%03d.m4s")
 
         cmd = [
-            "ffmpeg", "-y", "-i", input_file,
+            "ffmpeg", "-y", "-i", str(input_file),
             "-map", f"0:a:{i}",
             "-c:a", "aac",
             "-b:a", AUDIO_BITRATE,
@@ -129,12 +129,12 @@ def compute_scaled_width(src_w, src_h, target_h):
 def encode_video_quality(input_file, out_dir, label, target_h, bitrate, src_w, src_h):
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    playlist = out_dir / f"{label}.m3u8"
-    segment_pat = out_dir / f"{label}_%03d.m4s"
+    playlist = str(out_dir / f"{label}.m3u8")
+    segment_pat = str(out_dir / f"{label}_%03d.m4s")
     scaled_w = compute_scaled_width(src_w, src_h, target_h)
 
     cmd = [
-        "ffmpeg", "-y", "-i", input_file,
+        "ffmpeg", "-y", "-i", str(input_file),
         "-map", "0:v:0",
         "-vf", f"scale={scaled_w}:{target_h}",
         "-c:v", "libsvtav1",
