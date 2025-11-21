@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+
+import sys
+from pathlib import Path, PurePath
+
+# Si un fichier est passé en argument → on encode seulement celui-là
+if len(sys.argv) > 1:
+    input_files = [Path(sys.argv[1])]
+else:
+    input_files = list(INPUT_DIR.glob("*"))
+
+
 import subprocess
 import json
 import os
@@ -28,7 +39,129 @@ BITRATES = {
 AUDIO_BITRATE = "128k"
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output")
+
 # ------------------------------------------
+
+# ---------- COULEURS & HELPERS ----------
+# Palette ANSI (confirmée)
+CLR_RESET  = "\033[0m"
+CLR_OK     = "\033[92m"   # vert vif
+CLR_INFO   = "\033[94m"   # bleu clair
+CLR_WARN   = "\033[93m"   # jaune
+CLR_ERR    = "\033[91m"   # rouge
+CLR_BLOCK  = "\033[96m"   # cyan pour blocs remplis
+CLR_EMPTY  = "\033[90m"   # gris pour blocs vides
+CLR_PCT    = "\033[97m"   # blanc pour pourcentage
+CLR_ETA    = "\033[95m"   # magenta pour ETA
+CLR_SPEED  = "\033[92m"   # vert pour vitesse
+
+# largeur d'alignement des labels (pour logs alignés)
+LOG_LABEL_WIDTH = 30  # ajuste si tu veux plus court/long
+
+def log_info(label, msg):
+    lbl = f"{CLR_INFO}▶ {label.ljust(LOG_LABEL_WIDTH)}{CLR_RESET}"
+    print(f"{lbl} {msg}")
+
+def log_ok(label, msg):
+    lbl = f"{CLR_OK}✔ {label.ljust(LOG_LABEL_WIDTH)}{CLR_RESET}"
+    print(f"{lbl} {msg}")
+
+def log_warn(label, msg):
+    lbl = f"{CLR_WARN}⚠ {label.ljust(LOG_LABEL_WIDTH)}{CLR_RESET}"
+    print(f"{lbl} {msg}")
+
+def log_err(label, msg):
+    lbl = f"{CLR_ERR}✖ {label.ljust(LOG_LABEL_WIDTH)}{CLR_RESET}"
+    print(f"{lbl} {msg}")
+
+def hms(seconds):
+    seconds = int(round(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+# ----------------------------------------
+
+def progress_bar_40(pct):
+    """Barre 40 blocs : 1 bloc = 2.5%"""
+    bars = int(pct / 2.5)  # 100 / 2.5 = 40
+    if bars < 0: bars = 0
+    if bars > 40: bars = 40
+    filled = CLR_BLOCK + "█" * bars + CLR_RESET
+    empty  = CLR_EMPTY + "░" * (40 - bars) + CLR_RESET
+    return f"{filled}{empty}"
+
+def run_ffmpeg_with_progress(cmd, total_duration, label):
+    """
+    Exécute ffmpeg avec -progress pipe:1 en affichant :
+     - % (white)
+     - barre 40 blocs (cyan/gray)
+     - elapsed / total (HH:MM:SS)
+     - ETA (HH:MM:SS, magenta)
+     - speed (x.xx, vert)
+    Label is left-aligned to LOG_LABEL_WIDTH.
+    Raises CalledProcessError on non-zero return.
+    """
+    # safe pretty print of command
+    pretty = shlex.join([str(x) for x in cmd])
+    log_info(label, f"{pretty}")
+
+    # start process
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+    start = time.time()
+    current_time = 0.0
+    last_print = 0.0
+
+    # parse lines like: out_time_ms=1234567
+    out_time_re = re.compile(r"out_time_ms=(\d+)")
+    for raw in proc.stdout:
+        line = raw.strip()
+        m = out_time_re.match(line)
+        if m:
+            current_time = int(m.group(1)) / 1_000_000.0
+
+            if total_duration and total_duration > 0:
+                pct = min(100.0, (current_time / total_duration) * 100.0)
+            else:
+                pct = 0.0
+
+            elapsed = time.time() - start
+            speed = (current_time / elapsed) if elapsed > 0 else 0.0
+            remaining = ((total_duration - current_time) / speed) if (total_duration and speed > 0) else 0.0
+            if remaining < 0: remaining = 0.0
+
+            # throttle prints so terminal isn't overwhelmed (e.g. 5x / sec)
+            if time.time() - last_print > 0.2:
+                bar = progress_bar_40(pct)
+                pct_str = f"{CLR_PCT}{pct:5.1f}%{CLR_RESET}"
+                elapsed_str = hms(current_time)
+                total_str = hms(total_duration) if total_duration else "??:??:??"
+                eta_str = hms(remaining)
+                speed_str = f"{CLR_SPEED}{speed:.2f}x{CLR_RESET}"
+
+                #Aligned label
+                lbl = f"{label.ljust(LOG_LABEL_WIDTH)}"
+                sys.stdout.write(
+                    f"\r{CLR_INFO}{lbl}{CLR_RESET} "
+                    f"{pct_str} {bar}  "
+                    f"{elapsed_str} / {total_str}  {CLR_ETA}ETA:{eta_str}{CLR_RESET}  {speed_str}"
+                )
+                sys.stdout.flush()
+                last_print = time.time()
+
+    proc.wait()
+    # ensure newline after progress
+    print()
+
+    if proc.returncode != 0:
+        log_err(label, f"ffmpeg failed (code {proc.returncode})")
+        # print last output block for debug
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+    log_ok(label, "terminé.")
+    return True
+
 
 def run(cmd, check=True):
     """
@@ -86,9 +219,8 @@ def sanitize(text):
 def extract_all_subs(input_file, out_sub_dir, streams):
     """
     Extrait toutes les pistes subtitle texte en VTT.
-    - utilise les index réels (s['index'])
-    - skip les pistes bitmap (PGS/DVD)
-    - tente copy, si échoue force extraction en srt, puis convertit srt->vtt
+    Utilise run_ffmpeg_with_progress pour afficher la progression.
+    Skip bitmap (PGS/DVD).
     """
     input_file = Path(input_file)
     out_sub_dir = Path(out_sub_dir)
@@ -99,16 +231,29 @@ def extract_all_subs(input_file, out_sub_dir, streams):
 
     UNSUPPORTED = {"hdmv_pgs_subtitle", "dvd_subtitle", "xsub", "dvb_subtitle"}
 
-    for pos, s in enumerate(subs):
+    # obtenir la durée totale (pour calcul du %) - fallback None si échec
+    try:
+        total_duration = get_duration(str(input_file)) or 0.0
+    except:
+        total_duration = 0.0
+
+    for s in subs:
         real_index = s.get("index")
         codec = s.get("codec_name", "")
         lang = s.get("tags", {}).get("language", "")
         title = s.get("tags", {}).get("title", "")
 
+        label_base = f"Sous-titre #{real_index}"
+        if lang:
+            label_base += f" ({lang})"
+        if title:
+            label_base += f" {title}"
+
         if codec in UNSUPPORTED:
-            print(f"⚠️  Sous-titre #{real_index} ({codec}) ignoré (bitmap non convertible)")
+            log_warn(label_base, f"{codec} ignoré (bitmap non convertible)")
             continue
 
+        # safe filename
         fname = f"sub_{real_index}"
         if lang:
             fname += f"_{sanitize(lang)}"
@@ -118,69 +263,57 @@ def extract_all_subs(input_file, out_sub_dir, streams):
         tmp_srt = out_sub_dir / f"{fname}.srt"
         out_vtt = out_sub_dir / f"{fname}.vtt"
 
-        # 1) Tentative copy
+        # 1) Tentative COPY
         cmd_copy = [
-            "ffmpeg", "-y",
+            "ffmpeg", "-progress", "pipe:1", "-y",
             "-i", str(input_file),
             "-map", f"0:{real_index}",
             "-c:s", "copy",
             str(tmp_srt)
         ]
-
-        ok = True
         try:
-            run(cmd_copy)
-        except Exception:
-            ok = False
+            run_ffmpeg_with_progress(cmd_copy, total_duration, label=f"{label_base} (copy)")
+        except subprocess.CalledProcessError:
+            log_warn(label_base, "copy échoué, tentative forced...")
 
-        # 2) Si copy échoue ou fichier vide -> extraction forcée en SRT
-        if not ok or not tmp_srt.exists() or tmp_srt.stat().st_size == 0:
-            if tmp_srt.exists():
-                try:
-                    tmp_srt.unlink()
-                except Exception:
-                    pass
-            print(f"⚠️  Copy impossible sur #{real_index}, tentative extraction forcée en SRT...")
+        # check file existence and size
+        if not tmp_srt.exists() or tmp_srt.stat().st_size == 0:
+            # 2) forced extraction to srt
+            log_info(label_base, "extraction forcée en srt...")
             cmd_force = [
-                "ffmpeg", "-y",
+                "ffmpeg", "-progress", "pipe:1", "-y",
                 "-i", str(input_file),
                 "-map", f"0:{real_index}",
                 "-c:s", "srt",
                 str(tmp_srt)
             ]
             try:
-                run(cmd_force)
-            except Exception:
-                print(f"❌ Impossible d'extraire piste #{real_index} → skip")
+                run_ffmpeg_with_progress(cmd_force, total_duration, label=f"{label_base} (forced)")
+            except subprocess.CalledProcessError:
+                log_err(label_base, "extraction forcée échouée → skip")
                 if tmp_srt.exists():
-                    try:
-                        tmp_srt.unlink()
-                    except Exception:
-                        pass
+                    try: tmp_srt.unlink()
+                    except: pass
                 continue
 
-        # 3) Convertir SRT -> VTT
-        cmd_vtt = [
-            "ffmpeg", "-y",
-            "-i", str(tmp_srt),
-            str(out_vtt)
-        ]
+        # 3) Convert SRT -> VTT (we can show progress using duration of file)
         try:
-            run(cmd_vtt)
-        except Exception:
-            print(f"❌ Conversion en VTT impossible pour #{real_index} → skip")
-            if out_vtt.exists():
-                try:
-                    out_vtt.unlink()
-                except Exception:
-                    pass
-            continue
-        finally:
+            run_ffmpeg_with_progress(
+                ["ffmpeg", "-progress", "pipe:1", "-y", "-i", str(tmp_srt), str(out_vtt)],
+                total_duration,
+                label=f"{label_base} (VTT)"
+            )
+        except subprocess.CalledProcessError:
+            log_err(label_base, "conversion VTT échouée → skip")
             if tmp_srt.exists():
-                try:
-                    tmp_srt.unlink()
-                except Exception:
-                    pass
+                try: tmp_srt.unlink()
+                except: pass
+            continue
+
+        # cleanup srt
+        if tmp_srt.exists():
+            try: tmp_srt.unlink()
+            except: pass
 
         extracted.append({
             "index": real_index,
@@ -188,55 +321,10 @@ def extract_all_subs(input_file, out_sub_dir, streams):
             "lang": lang or "",
             "name": title or fname
         })
-        print(f"✅ Sous-titre #{real_index} extrait -> {out_vtt.name}")
+        log_ok(label_base, f"extrait -> {out_vtt.name}")
 
     return extracted
 
-def run_progress(cmd, duration, label=""):
-    print(f"\n▶ {label} : démarrage...\n")
-    pretty = shlex.join([str(x) for x in cmd])
-    print("CMD:", pretty)
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1
-    )
-
-    start_time = time.time()
-    current_time = 0
-
-    time_re = re.compile(r"out_time_ms=(\d+)")
-
-    for line in process.stdout:
-        line = line.strip()
-
-        m = time_re.match(line)
-        if m:
-            current_time = int(m.group(1)) / 1_000_000
-
-            if duration and duration > 0:
-                pct = (current_time / duration) * 100
-                elapsed = time.time() - start_time
-                speed = current_time / elapsed if elapsed > 0 else 1
-                remaining = (duration - current_time) / speed if speed > 0 else 0
-
-                sys.stdout.write(
-                    f"\r[{label}] {pct:5.1f}%  "
-                    f"({int(current_time)}/{int(duration)} sec)  "
-                    f"ETA: {int(remaining)} sec  "
-                )
-                sys.stdout.flush()
-
-    process.wait()
-    print()
-
-    if process.returncode != 0:
-        raise subprocess.CalledProcessError(process.returncode, cmd)
-
-    print(f"✔ {label} terminé.\n")
 
 def generate_audio_playlists(input_file, audio_root, streams):
     """
@@ -279,18 +367,18 @@ def generate_audio_playlists(input_file, audio_root, streams):
             "-hls_segment_filename", str(segment_pattern),
             str(playlist_path)
         ]
+        # calc duration once
+        duration = get_duration(str(input_file)) or 0.0
+
+        cmd_progress = cmd.copy()
+        cmd_progress.insert(1, "-progress")
+        cmd_progress.insert(2, "pipe:1")
+
+        # call unified runner
         try:
-            duration = get_duration(input_file)
-
-            cmd_progress = cmd.copy()
-            cmd_progress.insert(1, "-progress")
-            cmd_progress.insert(2, "pipe:1")
-
-            run_progress(cmd_progress, duration, label=f"Audio piste #{real_index}")
-
-
-        except Exception:
-            print(f"❌ Échec encodage audio piste #{real_index} → skip")
+            run_ffmpeg_with_progress(cmd_progress, duration, label=f"Audio piste #{real_index}")
+        except subprocess.CalledProcessError:
+            log_err(f"Audio piste #{real_index}", "échec encodage → skip")
             continue
 
         results.append({
@@ -338,19 +426,16 @@ def encode_video_quality(input_file, out_dir, label, target_h, bitrate, src_w, s
         "-hls_segment_filename", str(segment_pat),
         str(playlist)
     ]
+    duration = get_duration(str(input_file)) or 0.0
+
+    cmd_progress = cmd.copy()
+    cmd_progress.insert(1, "-progress")
+    cmd_progress.insert(2, "pipe:1")
 
     try:
-        duration = get_duration(input_file)
-
-        cmd_progress = cmd.copy()
-        cmd_progress.insert(1, "-progress")
-        cmd_progress.insert(2, "pipe:1")
-
-        run_progress(cmd_progress, duration, label=f"Video {label}")
-
-
-    except Exception:
-        print(f"❌ Échec encodage video {label} → skip")
+        run_ffmpeg_with_progress(cmd_progress, duration, label=f"Vidéo {label}")
+    except subprocess.CalledProcessError:
+        log_err(f"Vidéo {label}", "échec encodage → skip")
         raise
 
     return {
@@ -398,7 +483,6 @@ def write_master_header(master_path, audio_entries, subtitle_entries):
         m.write("\n")
 
 def main():
-    input_files = sorted([p for p in INPUT_DIR.iterdir() if p.is_file()])
     if not input_files:
         print("Aucun fichier trouvé dans ./input/")
         return

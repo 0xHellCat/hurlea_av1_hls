@@ -17,7 +17,11 @@ def main():
 
         print(f"\n=== Nouvel encodage : {file.name} ===")
 
-        subprocess.run(["python3", "encode_hls_av1.py"], check=True)
+        subprocess.run([
+            "python3",
+            "encode_hls_av1.py",
+            str(file)   # ⬅ FIX : on passe le fichier !
+        ], check=True)
 
     print("\n✔ Vérification terminée.")
 
