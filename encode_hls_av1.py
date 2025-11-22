@@ -3,31 +3,15 @@
 import sys
 from pathlib import Path, PurePath
 
-# Si un fichier est passé en argument → on encode seulement celui-là
-if len(sys.argv) > 1:
-    input_files = [Path(sys.argv[1])]
-else:
-    input_files = list(INPUT_DIR.glob("*"))
-
-
-import subprocess
-import json
-import os
-import sys
-import shlex
-import re
-import time
-from pathlib import Path
-
 # ----------------- CONFIG -----------------
 PRESET = "6"
 HLS_TIME = 4
 LADDER = {
-    "480p": 480,
-    "720p": 720,
-    "1080p": 1080,
-    "1440p": 1440,
-    "2160p": 2160
+    "480p": 854,
+    "720p": 1280,
+    "1080p": 1920,
+    "1440p": 2560,
+    "2160p": 3840
 }
 BITRATES = {
     "480p": "750k",
@@ -39,6 +23,20 @@ BITRATES = {
 AUDIO_BITRATE = "128k"
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output")
+# ------------------------------------------
+
+import subprocess
+import json
+import os
+import shlex
+import re
+import time
+
+# Si un fichier est passé en argument → on encode seulement celui-là
+if len(sys.argv) > 1:
+    input_files = [Path(sys.argv[1])]
+else:
+    input_files = list(INPUT_DIR.glob("*"))
 
 # ------------------------------------------
 
@@ -211,6 +209,44 @@ def get_video_resolution(streams):
             return int(s["width"]), int(s["height"])
     raise RuntimeError("Aucune piste vidéo trouvée")
 
+def select_audio_codec(stream):
+    """
+    Retourne le codec ffmpeg à utiliser selon le codec source.
+    Compatible HLS :
+        - AAC / AC3 / EAC3 → copy
+    Incompatible :
+        - TrueHD → EAC3 7.1
+        - DTS / DTS-HD → EAC3 5.1
+    """
+    codec = stream.get("codec_name", "").lower()
+
+    # --- Direct copy (aucune perte) ---
+    if codec in ("aac", "ac3", "eac3"):
+        return {
+            "codec": "copy",
+            "bitrate": None
+        }
+
+    # --- TrueHD → Atmos core → EAC3 7.1 ---
+    if codec == "truehd":
+        return {
+            "codec": "eac3",
+            "bitrate": "1536k"   # EXCELLENT pour garder l’Atmos core
+        }
+
+    # --- DTS & DTS-HD → EAC3 5.1 ---
+    if codec in ("dts", "dts_hd_ma", "dts-ma", "dts-hd"):
+        return {
+            "codec": "eac3",
+            "bitrate": "896k"
+        }
+
+    # Fallback sécurisé
+    return {
+        "codec": "eac3",
+        "bitrate": "640k"
+    }
+
 def sanitize(text):
     if not text:
         return ""
@@ -327,79 +363,124 @@ def extract_all_subs(input_file, out_sub_dir, streams):
 
 
 def generate_audio_playlists(input_file, audio_root, streams):
-    """
-    Crée une playlist HLS (audio-only fMP4) par piste audio.
-    Utilise l'index réel de chaque piste audio.
-    """
-    input_file = Path(input_file)
-    audio_root = Path(audio_root)
-    audio_root.mkdir(parents=True, exist_ok=True)
+    # streams est une liste brute -> on filtre les pistes audio
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
 
-    audios = [s for s in streams if s.get("codec_type") == "audio"]
-    results = []
+    entries = []
 
-    for a in audios:
-        real_index = a.get("index")
-        lang = sanitize(a.get("tags", {}).get("language", ""))
-        title = sanitize(a.get("tags", {}).get("title", ""))
+    for s in audio_streams:
+        idx = s["index"]
+        lang = s.get("tags", {}).get("language", "und")
 
-        base = f"audio_{real_index}"
-        if lang:
-            base += f"_{lang}"
+        out_dir = audio_root / f"audio_{idx}_{lang}"
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        audio_dir = audio_root / base
-        audio_dir.mkdir(parents=True, exist_ok=True)
+        out_m3u8 = out_dir / f"audio_{idx}_{lang}.m3u8"
+        seg_pattern = out_dir / f"audio_{idx}_{lang}_%03d.m4s"
 
-        playlist_path = audio_dir / f"{base}.m3u8"
-        segment_pattern = audio_dir / f"{base}_%03d.m4s"
+        print(f"\n▶ Audio piste #{idx} ({lang}) : extraction...")
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_file),
-            "-map", f"0:{real_index}",
-            "-c:a", "aac",
-            "-b:a", AUDIO_BITRATE,
-            "-vn",
-            "-f", "hls",
-            "-hls_time", str(HLS_TIME),
-            "-hls_playlist_type", "vod",
-            "-hls_segment_type", "fmp4",
-            "-hls_segment_filename", str(segment_pattern),
-            str(playlist_path)
-        ]
-        # calc duration once
-        duration = get_duration(str(input_file)) or 0.0
+        # Déterminer le codec à utiliser selon la source
+        audio_config = select_audio_codec(s)
+        codec = audio_config["codec"]
+        bitrate = audio_config.get("bitrate", AUDIO_BITRATE)
+        source_codec = s.get("codec_name", "").lower()
 
-        cmd_progress = cmd.copy()
-        cmd_progress.insert(1, "-progress")
-        cmd_progress.insert(2, "pipe:1")
+        # obtenir la durée totale pour la barre de progression
+        total_duration = get_duration(input_file) or 0.0
 
-        # call unified runner
-        try:
-            run_ffmpeg_with_progress(cmd_progress, duration, label=f"Audio piste #{real_index}")
-        except subprocess.CalledProcessError:
-            log_err(f"Audio piste #{real_index}", "échec encodage → skip")
+        # Fonction helper pour construire la commande
+        def build_cmd(audio_codec, audio_bitrate=None):
+            cmd = [
+                "ffmpeg", "-progress", "pipe:1", "-y",
+                "-i", input_file,
+                "-map", f"0:{idx}",
+                "-c:a", audio_codec,
+            ]
+            if audio_bitrate:
+                cmd.extend(["-b:a", audio_bitrate])
+            cmd.extend([
+                "-vn",
+                "-f", "hls",
+                "-hls_time", "4",
+                "-hls_playlist_type", "vod",
+                "-hls_segment_type", "fmp4",
+                "-hls_segment_filename", str(seg_pattern),
+                str(out_m3u8)
+            ])
+            return cmd
+
+        # Stratégie : essayer "copy" d'abord si possible, sinon ré-encoder
+        success = False
+        
+        if codec == "copy":
+            # Essayer d'abord avec copy (meilleure qualité, aucune perte)
+            log_info(f"Audio #{idx}", f"tentative copy ({source_codec})...")
+            cmd = build_cmd("copy")
+            
+            try:
+                run_ffmpeg_with_progress(cmd, total_duration, f"Audio #{idx} (copy)")
+                success = True
+            except subprocess.CalledProcessError:
+                log_warn(f"Audio #{idx}", "copy échoué, ré-encodage en AAC...")
+                # Si copy échoue, ré-encoder en AAC (compatible HLS fmp4)
+                codec = "aac"
+                bitrate = AUDIO_BITRATE
+        
+        if not success:
+            # Ré-encoder avec le codec approprié
+            if codec == "eac3":
+                log_info(f"Audio #{idx}", f"encodage EAC3 {bitrate}...")
+            else:
+                log_info(f"Audio #{idx}", f"encodage AAC {bitrate}...")
+            
+            cmd = build_cmd(codec, bitrate)
+            
+            try:
+                run_ffmpeg_with_progress(cmd, total_duration, f"Audio #{idx}")
+                success = True
+            except subprocess.CalledProcessError:
+                log_err(f"Audio #{idx}", "échec encodage → skip")
+                continue
+        
+        if not success:
+            log_err(f"Audio #{idx}", "échec → skip")
             continue
 
-        results.append({
-            "index": real_index,
-            "playlist": str(playlist_path),
-            "group_id": "audio",
-            "name": title or base,
-            "lang": lang or "und"
+        print(f"✔ Audio piste #{idx} → {out_m3u8.name}")
+
+        entries.append({
+            "type": "audio",
+            "index": idx,
+            "lang": lang,
+            "playlist": out_m3u8,
+            "name": f"Audio {lang}" if lang != "und" else f"Audio {idx}"
         })
-        print(f"✅ Audio piste #{real_index} -> {playlist_path.name}")
 
-    return results
+    return entries
 
-def compute_scaled_width(src_w, src_h, target_h):
-    w = int(round((target_h * src_w) / src_h))
-    return w + (w % 2)
 
-def encode_video_quality(input_file, out_dir, label, target_h, bitrate, src_w, src_h):
+
+def compute_scaled_size_from_width(src_w, src_h, target_w):
+    """
+    Calcule les dimensions redimensionnées en conservant le ratio d'aspect.
+    target_w est la largeur cible.
+    """
+    if target_w >= src_w:
+        return src_w, src_h
+    ratio = target_w / src_w
+    scaled_w = target_w
+    scaled_h = int(src_h * ratio)
+    # S'assurer que scaled_h est pair (requis par certains codecs)
+    if scaled_h % 2 != 0:
+        scaled_h += 1
+    return scaled_w, scaled_h
+
+def encode_video_quality(input_file, out_dir, label, target_w, bitrate, src_w, src_h):
     """
     Encode une qualité video-only AV1 dans out_dir.
     Retourne un dict avec playlist + bandwidth + resolution.
+    target_w est la largeur cible (LADDER contient des largeurs).
     """
     input_file = Path(input_file)
     out_dir = Path(out_dir)
@@ -407,13 +488,13 @@ def encode_video_quality(input_file, out_dir, label, target_h, bitrate, src_w, s
 
     playlist = out_dir / f"{label}.m3u8"
     segment_pat = out_dir / f"{label}_%03d.m4s"
-    scaled_w = compute_scaled_width(src_w, src_h, target_h)
+    scaled_w, scaled_h = compute_scaled_size_from_width(src_w, src_h, target_w)
 
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_file),
         "-map", "0:v:0",
-        "-vf", f"scale={scaled_w}:{target_h}",
+        "-vf", f"scale={scaled_w}:{scaled_h}",
         "-c:v", "libsvtav1",
         "-preset", PRESET,
         "-b:v", bitrate,
@@ -442,7 +523,7 @@ def encode_video_quality(input_file, out_dir, label, target_h, bitrate, src_w, s
         "label": label,
         "playlist": str(playlist),
         "bandwidth": int(bitrate.replace("k", "")) * 1000,
-        "resolution": f"{scaled_w}x{target_h}"
+        "resolution": f"{scaled_w}x{scaled_h}"
     }
 
 def append_master_video(master_path, entry):
@@ -517,12 +598,12 @@ def main():
 
         # 4) encode video qualities and append to master progressively
         print("\n--- Encodage vidéos ---")
-        for label, h in sorted(LADDER.items(), key=lambda x: x[1]):
-            if h > src_h:
+        for label, target_w in sorted(LADDER.items(), key=lambda x: x[1]):
+            if target_w > src_w:
                 continue
             out_dir = video_root / label
             try:
-                entry = encode_video_quality(str(file), out_dir, label, h, BITRATES[label], src_w, src_h)
+                entry = encode_video_quality(str(file), out_dir, label, target_w, BITRATES[label], src_w, src_h)
             except Exception:
                 print(f"⚠️ Encodage {label} échoué, on continue")
                 continue
