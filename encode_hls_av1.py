@@ -4,7 +4,7 @@ import sys
 from pathlib import Path, PurePath
 
 # ----------------- CONFIG -----------------
-PRESET = "6"
+PRESET = "13"
 HLS_TIME = 4
 LADDER = {
     "480p": 854,
