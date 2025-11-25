@@ -1,3 +1,7 @@
-#ignorer le push des dossiers input et output
-input/
-output/
+# Ignorer tout dans input sauf .gitkeep
+input/*
+!input/.gitkeep
+
+# Ignorer tout dans output sauf .gitkeep
+output/*
+!output/.gitkeep
