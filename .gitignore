@@ -5,3 +5,4 @@ input/*
 # Ignorer tout dans output sauf .gitkeep
 output/*
 !output/.gitkeep
+test.txt
