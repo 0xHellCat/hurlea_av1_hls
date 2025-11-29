@@ -252,6 +252,72 @@ def sanitize(text):
         return ""
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in text)
 
+def normalize_lang_code(lang):
+    """
+    Normalise le code de langue en majuscules (ex: fre -> FR, eng -> EN).
+    Gère les codes ISO 639-1 et 639-2.
+    """
+    if not lang:
+        return "UND"
+    
+    lang = lang.lower()
+    # Mapping des codes courants
+    lang_map = {
+        "fre": "FR", "fra": "FR", "fr": "FR",
+        "eng": "EN", "en": "EN",
+        "spa": "ES", "es": "ES",
+        "deu": "DE", "ger": "DE", "de": "DE",
+        "ita": "IT", "it": "IT",
+        "jpn": "JA", "ja": "JA",
+        "por": "PT", "pt": "PT",
+        "rus": "RU", "ru": "RU",
+        "chi": "ZH", "zh": "ZH",
+        "kor": "KO", "ko": "KO",
+    }
+    
+    if lang in lang_map:
+        return lang_map[lang]
+    
+    # Si code à 2 lettres, mettre en majuscules
+    if len(lang) == 2:
+        return lang.upper()
+    
+    # Sinon, prendre les 2 premières lettres en majuscules
+    return lang[:2].upper() if len(lang) >= 2 else lang.upper()
+
+def is_sdh_subtitle(stream):
+    """
+    Détecte si un sous-titre est SDH (Subtitles for Deaf and Hard of hearing).
+    """
+    title = stream.get("tags", {}).get("title", "") or stream.get("title", "")
+    if not title:
+        return False
+    
+    title_lower = title.lower()
+    sdh_keywords = ["sdh", "cc", "closed caption", "hearing impaired", "hi", "caption"]
+    return any(keyword in title_lower for keyword in sdh_keywords)
+
+def is_ad_audio(stream):
+    """
+    Détecte si une piste audio est AD (Audio Description pour aveugles).
+    """
+    title = stream.get("tags", {}).get("title", "") or stream.get("title", "")
+    if not title:
+        return False
+    
+    title_lower = title.lower()
+    ad_keywords = ["ad", "audio description", "descriptive", "dv", "dvs"]
+    return any(keyword in title_lower for keyword in ad_keywords)
+
+def can_stream_copy_subtitle(codec_name):
+    """
+    Retourne True si on peut raisonnablement tenter un copy → SRT.
+    """
+    if not codec_name:
+        return False
+    codec_name = codec_name.lower()
+    return codec_name in {"srt", "subrip", "text", "mov_text", "webvtt"}
+
 def extract_all_subs(input_file, out_sub_dir, streams):
     """
     Extrait toutes les pistes subtitle texte en VTT.
@@ -266,6 +332,9 @@ def extract_all_subs(input_file, out_sub_dir, streams):
     extracted = []
 
     UNSUPPORTED = {"hdmv_pgs_subtitle", "dvd_subtitle", "xsub", "dvb_subtitle"}
+    
+    # Compteur pour gérer les conflits de noms (même langue + même type)
+    name_counter = {}
 
     # obtenir la durée totale (pour calcul du %) - fallback None si échec
     try:
@@ -276,12 +345,35 @@ def extract_all_subs(input_file, out_sub_dir, streams):
     for s in subs:
         real_index = s.get("index")
         codec = s.get("codec_name", "")
-        lang = s.get("tags", {}).get("language", "")
-        title = s.get("tags", {}).get("title", "")
+        # Récupérer lang et title depuis tags, mais aussi vérifier directement dans le stream
+        lang = s.get("tags", {}).get("language", "") or s.get("language", "")
+        title = s.get("tags", {}).get("title", "") or s.get("title", "")
+        
+        # Exclure les sous-titres SDH
+        if is_sdh_subtitle(s):
+            log_warn(f"Sous-titre #{real_index}", f"SDH ignoré ({title})")
+            continue
+        
+        # Détecter les sous-titres forcés
+        # 1. Vérifier disposition.forced
+        disposition = s.get("disposition", {})
+        is_forced = disposition.get("forced", 0) == 1
+        
+        # 2. Vérifier dans les tags (certains conteneurs)
+        if not is_forced:
+            forced_tag = s.get("tags", {}).get("forced", "").lower()
+            is_forced = forced_tag in ("1", "true", "yes")
+        
+        # 3. Vérifier dans le titre (Matroska utilise souvent "Forced" dans le titre)
+        if not is_forced and title:
+            title_lower = title.lower()
+            is_forced = "forced" in title_lower
 
         label_base = f"Sous-titre #{real_index}"
         if lang:
             label_base += f" ({lang})"
+        if is_forced:
+            label_base += " [Forced]"
         if title:
             label_base += f" {title}"
 
@@ -289,33 +381,49 @@ def extract_all_subs(input_file, out_sub_dir, streams):
             log_warn(label_base, f"{codec} ignoré (bitmap non convertible)")
             continue
 
-        # safe filename
-        fname = f"sub_{real_index}"
-        if lang:
-            fname += f"_{sanitize(lang)}"
-        if title:
-            fname += f"_{sanitize(title)}"
-
-        tmp_srt = out_sub_dir / f"{fname}.srt"
+        # Format du nom de fichier : {LANG}_{TYPE}.vtt
+        lang_code = normalize_lang_code(lang)
+        sub_type = "Forced" if is_forced else "Full"
+        base_fname = f"{lang_code}_{sub_type}"
+        
+        # Gérer les conflits de noms (même langue + même type)
+        name_key = f"{lang_code}_{sub_type}"
+        if name_key in name_counter:
+            name_counter[name_key] += 1
+            fname = f"{base_fname}_{name_counter[name_key]}"
+        else:
+            name_counter[name_key] = 0
+            fname = base_fname
+        
         out_vtt = out_sub_dir / f"{fname}.vtt"
+        
+        # Pour le fichier temporaire SRT, utiliser un nom unique basé sur l'index
+        tmp_srt = out_sub_dir / f"temp_{real_index}.srt"
 
-        # 1) Tentative COPY
-        cmd_copy = [
-            "ffmpeg", "-progress", "pipe:1", "-y",
-            "-i", str(input_file),
-            "-map", f"0:{real_index}",
-            "-c:s", "copy",
-            str(tmp_srt)
-        ]
-        try:
-            run_ffmpeg_with_progress(cmd_copy, total_duration, label=f"{label_base} (copy)")
-        except subprocess.CalledProcessError:
-            log_warn(label_base, "copy échoué, tentative forced...")
+        # 1) Tentative COPY (uniquement si codec compatible)
+        copy_success = False
+        if can_stream_copy_subtitle(codec):
+            cmd_copy = [
+                "ffmpeg", "-progress", "pipe:1", "-y",
+                "-i", str(input_file),
+                "-map", f"0:{real_index}",
+                "-c:s", "copy",
+                str(tmp_srt)
+            ]
+            try:
+                run_ffmpeg_with_progress(cmd_copy, total_duration, label=f"{label_base} (copy)")
+                if tmp_srt.exists() and tmp_srt.stat().st_size > 0:
+                    copy_success = True
+                else:
+                    log_warn(label_base, "copy terminé mais fichier vide → conversion nécessaire")
+            except subprocess.CalledProcessError:
+                log_warn(label_base, "copy échoué, tentative conversion SRT...")
+        else:
+            log_info(label_base, f"codec {codec} incompatible copy → conversion SRT directe")
 
-        # check file existence and size
-        if not tmp_srt.exists() or tmp_srt.stat().st_size == 0:
-            # 2) forced extraction to srt
-            log_info(label_base, "extraction forcée en srt...")
+        if not copy_success:
+            # Conversion forcée vers SRT
+            log_info(label_base, "conversion vers SRT...")
             cmd_force = [
                 "ffmpeg", "-progress", "pipe:1", "-y",
                 "-i", str(input_file),
@@ -324,18 +432,31 @@ def extract_all_subs(input_file, out_sub_dir, streams):
                 str(tmp_srt)
             ]
             try:
-                run_ffmpeg_with_progress(cmd_force, total_duration, label=f"{label_base} (forced)")
+                run_ffmpeg_with_progress(cmd_force, total_duration, label=f"{label_base} (to SRT)")
             except subprocess.CalledProcessError:
-                log_err(label_base, "extraction forcée échouée → skip")
+                log_err(label_base, "conversion SRT échouée → skip")
                 if tmp_srt.exists():
                     try: tmp_srt.unlink()
                     except: pass
                 continue
 
+        # Vérifier que le SRT existe réellement
+        if not tmp_srt.exists() or tmp_srt.stat().st_size == 0:
+            log_err(label_base, "SRT introuvable ou vide après conversion → skip")
+            if tmp_srt.exists():
+                try: tmp_srt.unlink()
+                except: pass
+            continue
+
         # 3) Convert SRT -> VTT (we can show progress using duration of file)
         try:
             run_ffmpeg_with_progress(
-                ["ffmpeg", "-progress", "pipe:1", "-y", "-i", str(tmp_srt), str(out_vtt)],
+                [
+                    "ffmpeg", "-progress", "pipe:1", "-y",
+                    "-i", str(tmp_srt),
+                    "-c:s", "webvtt",
+                    str(out_vtt)
+                ],
                 total_duration,
                 label=f"{label_base} (VTT)"
             )
@@ -351,11 +472,15 @@ def extract_all_subs(input_file, out_sub_dir, streams):
             try: tmp_srt.unlink()
             except: pass
 
+        # Nom d'affichage pour le master playlist
+        display_name = f"{lang_code} {sub_type}" if lang_code != "UND" else f"Subtitle {sub_type}"
+        
         extracted.append({
             "index": real_index,
             "path": str(out_vtt),
             "lang": lang or "",
-            "name": title or fname
+            "name": display_name,
+            "forced": is_forced
         })
         log_ok(label_base, f"extrait -> {out_vtt.name}")
 
@@ -369,6 +494,13 @@ def generate_audio_playlists(input_file, audio_root, streams):
     entries = []
 
     for s in audio_streams:
+        # Exclure les pistes audio AD (Audio Description)
+        if is_ad_audio(s):
+            idx = s.get("index")
+            title = s.get("tags", {}).get("title", "") or s.get("title", "")
+            log_warn(f"Audio #{idx}", f"AD ignoré ({title})")
+            continue
+        
         idx = s["index"]
         lang = s.get("tags", {}).get("language", "und")
 
@@ -557,9 +689,10 @@ def write_master_header(master_path, audio_entries, subtitle_entries):
         # subtitles
         for s in subtitle_entries:
             rel = os.path.relpath(s["path"], start=str(master_path.parent))
+            forced_flag = "YES" if s.get("forced", False) else "NO"
             m.write(
                 f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{s["name"]}",'
-                f'LANGUAGE="{s["lang"]}",DEFAULT=NO,AUTOSELECT=NO,FORCED=NO,URI="{rel}"\n'
+                f'LANGUAGE="{s["lang"]}",DEFAULT=NO,AUTOSELECT=NO,FORCED={forced_flag},URI="{rel}"\n'
             )
         m.write("\n")
 
